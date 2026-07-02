@@ -16,3 +16,4 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+generated/

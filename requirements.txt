@@ -1,0 +1,4 @@
+openai
+python-dotenv
+pytest
+# (coverage will be added later)
