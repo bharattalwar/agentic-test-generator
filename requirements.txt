@@ -1,4 +1,6 @@
 openai
 python-dotenv
 pytest
+langgraph
+langchain-openai
 # (coverage will be added later)
