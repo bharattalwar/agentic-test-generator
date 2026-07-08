@@ -237,8 +237,109 @@ A per-module record of the Python features/functions used and why. Updated as we
 - **Early `return`** on success — exits the loop the moment the suite passes (the decision point).
 - *Interview note:* this loop is the ReAct pattern realized — Reason (LLM) + Act (run tests) + Observe (results) + Decide (stop/revise), with bounded autonomy. It's exactly what LangGraph will formalize as a state graph.
 
+### `agent_graph.py` (the LangGraph refactor)
+This is the same generate → run → decide loop from `orchestrator.py`, re-expressed as an explicit graph. Built from scratch first, then adopted the framework — the intended interview story ("I understand the loop well enough to hand-roll it, then chose LangGraph for the state/observability it gives for free").
+- **`class AgentState(TypedDict)`** — the shared state that flows through the graph. `TypedDict` = a dict with a declared shape (keys + types) but still a plain dict at runtime; LangGraph passes this between nodes. Replaces the loose loop variables (`previous_tests`, `last_result`) with one typed object.
+- **Node functions (`generate_node`, `run_node`)** — each takes the state and returns a **partial dict** of only the keys it changed; LangGraph merges those updates back into the state. `generate_node` = Reason/Act (write tests); `run_node` = Observe (run pytest via the *same* `run_tests` tool the orchestrator used — one tool, two drivers).
+- **`ChatOpenAI` (langchain-openai)** — LangChain's OpenAI wrapper; plays the role the hand-written `LLMClient` did. `.invoke([("system", ...), ("human", ...)])` returns a message whose `.content` is the text.
+- **`should_continue(state) -> str`** — the DECIDE step as a **router**: returns a *string* naming the next hop (`"revise"` or `"end"`), based on `last_result.passed` and the iteration guardrail. Pure decision, no side effects.
+- **`StateGraph(AgentState)`** — the graph builder, typed on the state shape.
+- **`add_node(name, fn)`** — register a node. **`set_entry_point("generate")`** — where every run starts. **`add_edge("generate", "run")`** — a *plain* edge that always fires.
+- **`add_conditional_edges("run", should_continue, {...})`** — the branch: run the router after `run`, then map its returned string through the **path map** (`{"revise": "generate", "end": END}`) to the real destination. `"revise" → "generate"` is the **cycle** (the loop); `END` is LangGraph's terminal sentinel.
+- **`.compile()`** — turns the definition into a runnable app; call `app.invoke(initial_state)` to execute, which returns the final state.
+- *Interview note:* chains run one direction; graphs can loop. The backward `revise → generate` edge is what makes this a **stateful agent** and not a linear pipeline — the reason LangGraph is the go-to for cyclic, stateful agent workflows. Same four verbs as the orchestrator; the difference is the control flow is now **data** (nodes + edges) you can inspect, visualize, checkpoint, and extend, instead of being trapped inside a `for` loop.
+
 ### Python vocabulary (quick reference)
 - **Built-in function** — available without import (`print`, `len`, `open`, `isinstance`, `range`). Lives in the `builtins` namespace.
 - **Standard library** — ships with Python but must be imported (`pathlib`, `ast`, `re`, `os`, `subprocess`, `tempfile`, `json`). No `pip install`.
 - **Third-party** — installed via `pip` (`openai`, `python-dotenv`, `pytest`).
 - **Function vs method** — a *function* is called alone (`len(x)`); a *method* belongs to an object and is called with a dot (`path.write_text(x)`, `"hi".upper()`). E.g. `Path.write_text` is a *method* from the *standard library* — not a built-in.
+
+---
+
+## 7. Agentic Refactor — Concept Walkthrough (orchestrator → LangGraph)
+
+> I wrote this section as a teaching narrative so I (and anyone I walk through the project) can follow it top-to-bottom without prior LangChain/LangGraph knowledge. It mirrors the exact order I built it in.
+
+### 7.1 The one idea: I already built an agent
+
+Before any framework, my `orchestrator.py` was already an agent. Its `for`-loop does three things, over and over:
+
+1. **Generate** — call the LLM to write tests (ACT).
+2. **Observe** — run those tests with `run_tests` and see what happened.
+3. **Decide** — if they pass, stop; if they fail and I have attempts left, loop back and revise.
+
+Generate → Observe → Decide, repeating, with a cap on attempts. That *is* an agent. This loop is the **ReAct pattern** (Reason + Act): the model reasons about what to write, acts by running a tool, and uses the observation to reason again. Everything after this is just a cleaner way to *express* this same loop — not a smarter idea.
+
+### 7.2 Two libraries, two different jobs (the thing everyone confuses)
+
+- **LangChain** = the toolkit for *talking to the model*. Its `ChatOpenAI` object is a thin wrapper around the OpenAI API. It replaces my hand-written `llm_client.py`. Benefit: a standard interface — I could swap OpenAI for Claude by changing one line, and every LangChain/LangGraph piece speaks this same interface.
+- **LangGraph** = the toolkit for *structuring the loop*. It replaces the `for`-loop in `orchestrator.py` with **nodes** and **edges**. It does not talk to the model itself — the nodes do that (using LangChain).
+
+One-line memory hook: **LangChain talks to the model; LangGraph organizes the steps.**
+
+### 7.3 State — the shared memory
+
+My `for`-loop kept its working memory in local variables (`previous_tests`, `last_result`, `iteration`). A graph has no single loop scope, because the steps are separate functions. So all that memory has to live in **one shared object that gets passed from step to step** — the **State**.
+
+I declare its shape with a `TypedDict` (`AgentState`) — literally a list of the keys the state holds and their types: `src`, `iteration`, `test_code`, `last_result`, `status`. At runtime it's still an ordinary dict; the `TypedDict` just documents and type-checks the shape.
+
+### 7.4 A node is just a function
+
+A **node** is a plain Python function that:
+
+- takes the whole `state` as input, and
+- returns a **dict of only the keys it changed**.
+
+LangGraph merges that returned dict back into the state for me. That merge is the entire mechanism — the same thing as calling `state.update(returned_dict)` by hand (which is literally how I tested the nodes before wiring the graph). Two nodes:
+
+- **`generate_node`** — the ACT step. First attempt (`iteration == 0`) generates from scratch with `build_generation_prompt`; later attempts **revise** with `build_revision_prompt`, feeding the previous tests + the real pytest failure output back to the model. It calls `ChatOpenAI.invoke([...])` and returns the cleaned `test_code` plus a bumped `iteration`.
+- **`run_node`** — the OBSERVE step. Runs the tests with the *same* `run_tests` tool the orchestrator uses (subprocess pytest in a temp sandbox), and returns `last_result` + a `status`.
+
+Key point for the interview: I did **not** rebuild the work. `run_tests` and the prompt builders are reused unchanged. The graph only changes *how the steps are wired*, not *what they do*.
+
+### 7.5 Edges, and the decision that makes it loop
+
+Edges connect nodes.
+
+- A **plain edge** always fires: `add_edge("generate", "run")` means "after generate, always go to run."
+- The **entry point** (`set_entry_point("generate")`) is where every run starts.
+- `END` is LangGraph's built-in "stop here" marker.
+
+The DECIDE step is a **router function**, `should_continue(state) -> str`. It is *not* a node — it does no work and changes no state. It just looks at the state and returns a **string** naming where to go next:
+
+- tests passed → `"end"`
+- out of attempts (`iteration >= max_iterations`) → `"end"`
+- failed but attempts remain → `"revise"`
+
+That string is turned into a real destination by a **conditional edge**:
+
+```python
+graph.add_conditional_edges("run", should_continue, {"revise": "generate", "end": END})
+```
+
+This reads: "after `run`, call `should_continue`; take the string it returns; look it up in this path map to find the next node." The entry `"revise": "generate"` points **backward** to `generate` — and a backward edge is the **cycle**. That cycle is the whole reason to use LangGraph: chains run one direction; a graph can loop. The loop is what makes this a **stateful agent** instead of a straight-line pipeline.
+
+### 7.6 Compile and run
+
+`graph.compile()` freezes the wiring into a runnable app. `app.invoke(initial_state)` starts at the entry point, walks the edges, merges each node's updates into the state, and returns the final state — exactly what my `for`-loop did, but now the control flow is **data** (nodes + edges) I can inspect, draw, checkpoint, and extend, rather than logic buried inside a loop.
+
+### 7.7 Terminology I want to get exactly right (so I don't fumble it live)
+
+- **Node vs router.** `generate_node` and `run_node` are nodes (they do work and update state). `should_continue` is a **router / conditional-edge function** (it only decides direction). Calling it a "decision node" is loose; interviewers may probe this.
+- **LangChain vs LangGraph.** ChatOpenAI (the model wrapper) is **LangChain**. StateGraph / nodes / edges is **LangGraph**. I keep these separate.
+- **`LLMResponse`.** My dataclass is used on the hand-built `orchestrator` path (via `LLMClient`). On the LangGraph path, `ChatOpenAI` returns its own message object and I read `.content`, so `LLMResponse` isn't used there — worth stating plainly.
+- **This is not RAG.** See INTERVIEW_PREP.md §RAG. This project retrieves nothing from a knowledge base; it's an agentic loop. RAG is a different technique that can be *added* to an agent, but generate/observe/decide is not RAG.
+
+### 7.8 The two implementations, side by side
+
+| | `orchestrator.py` (hand-built) | `agent_graph.py` (LangGraph) |
+|---|---|---|
+| Loop | Python `for` with `max_iterations` | Graph with a conditional-edge cycle |
+| Memory | local variables | `AgentState` (TypedDict) |
+| Model call | `LLMClient` (my wrapper) | `ChatOpenAI` (LangChain) |
+| The tool | `run_tests` | `run_tests` (same) |
+| Decide | `if result.passed: return` | `should_continue` router |
+| Why keep both | proves I understand the loop from first principles | shows I can adopt the standard framework |
+
+Interview story in one line: *"I built the agent loop by hand first so I understood every moving part, then refactored it into LangGraph to get standard state handling, a visualizable graph, and room to grow — keeping the hand-built version to show the fundamentals."*
